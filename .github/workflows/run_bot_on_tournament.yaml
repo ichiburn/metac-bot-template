@@ -42,3 +42,15 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
           ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
+          # [local patch] Non-secret switches. Set them under Settings --> Secrets and variables --> Actions --> Variables.
+          # Unset variables fall back to the defaults after "||".
+          # MiniBench: default off. To join from 2026-11-02 09:00 JST, set repository variable ENABLE_MINIBENCH=true on 11/01.
+          ENABLE_MINIBENCH: ${{ vars.ENABLE_MINIBENCH || 'false' }}
+          # Variant: V0 | V1 | V2 | V3 | V4 | V5 | TEMPLATE (see CHANGES.md)
+          BOT_VARIANT: ${{ vars.BOT_VARIANT || 'V0' }}
+          # Spending cap per run (USD) enforced with MonetaryCostManager
+          BOT_MAX_COST_USD: ${{ vars.BOT_MAX_COST_USD || '1.00' }}
+          # Optional model overrides (empty = defaults in bot_config.py)
+          BOT_CHEAP_MODEL: ${{ vars.BOT_CHEAP_MODEL }}
+          BOT_STRONG_MODEL: ${{ vars.BOT_STRONG_MODEL }}
+          BOT_RESEARCHER: ${{ vars.BOT_RESEARCHER }}

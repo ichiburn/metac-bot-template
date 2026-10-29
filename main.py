@@ -1,10 +1,17 @@
 import argparse
 import asyncio
+import contextlib
+import inspect
 import logging
+import sys
 from datetime import datetime, timezone
 from typing import Literal
 
 import dotenv
+
+# [local patch] configuration switches (MiniBench flag, variants V0-V5, cost cap) and log redaction.
+import bot_config
+from log_redaction import RedactingStream, install_redaction
 
 # Runtime helpers (env validation, banners, dependency-warning suppression).
 from bot_helpers import (
@@ -43,6 +50,10 @@ from forecasting_tools import (
 
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
+
+# [local patch] Parent aggregation hook. Its name/signature in forecasting-tools is 未確認
+# (not verifiable from files on the box); we only override it if it exists.
+_PARENT_AGGREGATE = getattr(ForecastBot, "_aggregate_predictions", None)
 
 
 class FallTemplateBot2026(ForecastBot):
@@ -125,6 +136,66 @@ class FallTemplateBot2026(ForecastBot):
     )
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
     _structure_output_validation_samples = 2
+
+    # [local patch] Variant support (PLAN.md §3.2, V0-V5). Set via configure_variant().
+    _variant: "bot_config.VariantConfig | None" = None
+    _variant_forecasters: list | None = None  # list[GeneralLlm], one per forecast call
+    _forecaster_counters: dict | None = None
+
+    def configure_variant(self, variant: "bot_config.VariantConfig") -> None:
+        self._variant = variant
+        self._forecaster_counters = {}
+        if variant.uses_custom_llms:
+            self._variant_forecasters = [
+                _make_llm(model) for model in variant.forecaster_models
+            ]
+        else:
+            self._variant_forecasters = None
+
+    def _forecaster_llm(self, question: MetaculusQuestion):
+        """LLM for one forecast call. V4 cycles strong,strong,cheap,cheap,cheap per question."""
+        if not self._variant_forecasters:
+            return self.get_llm("default", "llm")
+        if self._forecaster_counters is None:
+            self._forecaster_counters = {}
+        key = getattr(question, "page_url", None) or id(question)
+        idx = bot_config.pick_forecaster_index(
+            self._forecaster_counters, key, len(self._variant_forecasters)
+        )
+        return self._variant_forecasters[idx]
+
+    def _maybe_trimmed_mean(self, args: tuple, kwargs: dict):
+        """V2: trimmed mean for binary (list of floats). Returns None to delegate to the library."""
+        if self._variant is None or self._variant.aggregation != "trimmed_mean":
+            return None
+        candidates = [a for a in args if isinstance(a, list)] + [
+            v for v in kwargs.values() if isinstance(v, list)
+        ]
+        if not candidates:
+            return None
+        preds = candidates[0]
+        if preds and all(
+            isinstance(p, (int, float)) and not isinstance(p, bool) for p in preds
+        ):
+            value = bot_config.trimmed_mean(preds)
+            return max(0.01, min(0.99, value))
+        return None
+
+    if _PARENT_AGGREGATE is not None and inspect.iscoroutinefunction(_PARENT_AGGREGATE):
+
+        async def _aggregate_predictions(self, *args, **kwargs):  # type: ignore[override]
+            custom = self._maybe_trimmed_mean(args, kwargs)
+            if custom is not None:
+                return custom
+            return await _PARENT_AGGREGATE(self, *args, **kwargs)
+
+    elif _PARENT_AGGREGATE is not None and callable(_PARENT_AGGREGATE):
+
+        def _aggregate_predictions(self, *args, **kwargs):  # type: ignore[override]
+            custom = self._maybe_trimmed_mean(args, kwargs)
+            if custom is not None:
+                return custom
+            return _PARENT_AGGREGATE(self, *args, **kwargs)
 
     ##################################### RESEARCH #####################################
 
@@ -235,7 +306,7 @@ class FallTemplateBot2026(ForecastBot):
         question: BinaryQuestion,
         prompt: str,
     ) -> ReasonedPrediction[float]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self._forecaster_llm(question).invoke(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         parsing_instructions = clean_indents(
             f"""
@@ -317,7 +388,7 @@ class FallTemplateBot2026(ForecastBot):
             {self._create_resolved_question_parsing_message()}
             """
         )
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self._forecaster_llm(question).invoke(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         predicted_option_list: PredictedOptionList = await structure_output(
             text_to_structure=reasoning,
@@ -400,7 +471,7 @@ class FallTemplateBot2026(ForecastBot):
         question: NumericQuestion,
         prompt: str,
     ) -> ReasonedPrediction[NumericDistribution]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self._forecaster_llm(question).invoke(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         parsing_instructions = clean_indents(
             f"""
@@ -496,7 +567,7 @@ class FallTemplateBot2026(ForecastBot):
         question: DateQuestion,
         prompt: str,
     ) -> ReasonedPrediction[NumericDistribution]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self._forecaster_llm(question).invoke(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         parsing_instructions = clean_indents(
             f"""
@@ -683,11 +754,104 @@ class FallTemplateBot2026(ForecastBot):
         )
 
 
+# [local patch] helpers ---------------------------------------------------------------------------
+
+
+def _make_llm(model: str):
+    # Same parameters as the commented-out example in the template.
+    # [local patch 2026-10-23] + extra_body.provider {"data_collection": "deny", "zdr": true} for OpenRouter.
+    return GeneralLlm(
+        model=model,
+        temperature=0.3,
+        timeout=40,
+        allowed_tries=2,
+        **bot_config.openrouter_provider_kwargs(model),
+    )
+
+
+def _make_plain_llm(model: str):
+    """summarizer / parser: keep the plain model-id string unless it is an OpenRouter model, in which
+    case wrap it in GeneralLlm so the provider field can be attached (other params = library defaults)."""
+    extra = bot_config.openrouter_provider_kwargs(model)
+    if not extra:
+        return model
+    return GeneralLlm(model=model, **extra)
+
+
+def _install_openrouter_guard() -> None:
+    """Single choke point: every litellm call to OpenRouter carries the fixed provider field.
+    Fails closed (SystemExit) if litellm cannot be imported. No env switch to disable it."""
+    try:
+        n = bot_config.install_openrouter_provider_guard()
+    except ImportError:
+        raise SystemExit(
+            "litellm could not be imported; refusing to run without the OpenRouter provider guard "
+            "(provider.data_collection=deny, provider.zdr=true)."
+        )
+    logger.info(
+        f"OpenRouter provider guard ON: data_collection=deny, zdr=true ({n} litellm references wrapped)"
+    )
+
+
+def _build_llms(variant: "bot_config.VariantConfig") -> dict | None:
+    """llms= for FallTemplateBot2026. None for TEMPLATE (use forecasting-tools defaults)."""
+    if not variant.uses_custom_llms:
+        return None
+    researcher = bot_config.resolve_researcher(variant)
+    if researcher not in ("no_research", "None") and not researcher.startswith(
+        ("asknews/", "smart-searcher")
+    ):
+        researcher = _make_llm(researcher)
+    return {
+        "default": _make_llm(variant.forecaster_models[0]),
+        "summarizer": _make_plain_llm(variant.cheap_model),
+        "researcher": researcher,
+        "parser": _make_plain_llm(variant.parser_model),
+    }
+
+
+def _make_cost_manager(max_cost: float):
+    """MonetaryCostManager(max_cost) as used in the forecasting-tools README.
+
+    Exact signature / exception type / contextvar propagation into asyncio.run are 未確認.
+    Fails closed (SystemExit) if it cannot be imported, unless BOT_ALLOW_NO_COST_CAP=true.
+    """
+    try:
+        from forecasting_tools import MonetaryCostManager
+    except ImportError:
+        if bot_config.allow_no_cost_cap():
+            logger.warning(
+                "MonetaryCostManager unavailable; running WITHOUT a spending cap (BOT_ALLOW_NO_COST_CAP=true)"
+            )
+            return contextlib.nullcontext(None)
+        raise SystemExit(
+            "MonetaryCostManager could not be imported; refusing to run without a spending cap. "
+            "Set BOT_ALLOW_NO_COST_CAP=true to override."
+        )
+    return MonetaryCostManager(max_cost)
+
+
+def _current_cost(cost_manager) -> float | None:
+    if cost_manager is None:
+        return None
+    value = getattr(cost_manager, "current_usage", None)
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 if __name__ == "__main__":
+    # [local patch] redact secrets in everything written to stdout/stderr (print banners + logs).
+    if bot_config.env_flag("BOT_REDACT_STDIO", default=True):
+        sys.stdout = RedactingStream(sys.stdout)
+        sys.stderr = RedactingStream(sys.stderr)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
+    install_redaction()
+    _install_openrouter_guard()  # [local patch 2026-10-23] provider.data_collection=deny / zdr=true
 
     parser = argparse.ArgumentParser(description="Run the template forecasting bot")
     parser.add_argument(
@@ -701,20 +865,38 @@ if __name__ == "__main__":
     run_mode: Literal["tournament", "metaculus_cup", "test_questions"] = args.mode
 
     check_environment(strict=True)
-    publish_to_metaculus = True
+    publish_to_metaculus = bot_config.publish_enabled()  # [local patch] default True as in template
     print_startup_banner(run_mode, will_publish=publish_to_metaculus)
+
+    # [local patch] variant / MiniBench flag / spending cap
+    variant = bot_config.build_variant()
+    include_minibench = bot_config.minibench_enabled()
+    max_cost_usd = bot_config.get_max_cost_usd()
+    logger.info(
+        f"Variant={variant.name} ({variant.description}); "
+        f"predictions_per_research_report={variant.predictions_per_research_report}; "
+        f"aggregation={variant.aggregation}; MiniBench={'ON' if include_minibench else 'OFF'}; "
+        f"max_cost_usd={max_cost_usd:.2f}; publish={publish_to_metaculus}"
+    )
+    if variant.aggregation == "trimmed_mean" and _PARENT_AGGREGATE is None:
+        logger.warning(
+            "ForecastBot._aggregate_predictions not found: V2 trimmed mean is NOT applied "
+            "(library default aggregation is used)."
+        )
+    variant_llms = _build_llms(variant)
 
     # Configure the bot. The `llms=` block below is commented out to use
     # whichever default models forecasting-tools picks based on your env vars;
     # uncomment and edit to pin specific models.
     template_bot = FallTemplateBot2026(
-        research_reports_per_question=1,
-        predictions_per_research_report=5,
+        research_reports_per_question=variant.research_reports_per_question,
+        predictions_per_research_report=variant.predictions_per_research_report,
         use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=publish_to_metaculus,
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
+        **({"llms": variant_llms} if variant_llms is not None else {}),
         # llms={
         #     "default": GeneralLlm(
         #         model="openrouter/openai/gpt-4o",
@@ -727,6 +909,7 @@ if __name__ == "__main__":
         #     "parser": "openai/gpt-4o-mini",
         # },
     )
+    template_bot.configure_variant(variant)
 
     # Per-mode tournament URL shown in the summary banner footer. These
     # piggyback on the forecasting_tools SDK constants and need updating
@@ -740,40 +923,57 @@ if __name__ == "__main__":
     # Dispatch on mode. Each branch produces a list of ForecastReport (or
     # exceptions, since return_exceptions=True) which then flows into the
     # summary printers below.
-    client = MetaculusClient()
-    if run_mode == "tournament":
-        seasonal_tournament_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                client.CURRENT_AI_COMPETITION_ID, return_exceptions=True
+    # [local patch] Everything that calls LLMs runs inside the spending cap.
+    with _make_cost_manager(max_cost_usd) as cost_manager:
+        client = MetaculusClient()
+        if run_mode == "tournament":
+            seasonal_tournament_reports = asyncio.run(
+                template_bot.forecast_on_tournament(
+                    client.CURRENT_AI_COMPETITION_ID, return_exceptions=True
+                )
             )
-        )
-        minibench_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                client.CURRENT_MINIBENCH_ID, return_exceptions=True
+            # [local patch] MiniBench only when ENABLE_MINIBENCH is on (default off; first run 2026-11-02)
+            spent = _current_cost(cost_manager)
+            if not include_minibench:
+                logger.info("MiniBench skipped (ENABLE_MINIBENCH is off)")
+                minibench_reports = []
+            elif spent is not None and spent >= max_cost_usd:
+                logger.warning(
+                    f"MiniBench skipped: spending cap reached (${spent:.4f} >= ${max_cost_usd:.2f})"
+                )
+                minibench_reports = []
+            else:
+                minibench_reports = asyncio.run(
+                    template_bot.forecast_on_tournament(
+                        client.CURRENT_MINIBENCH_ID, return_exceptions=True
+                    )
+                )
+            forecast_reports = seasonal_tournament_reports + minibench_reports
+        elif run_mode == "metaculus_cup":
+            # The Metaculus Cup may be uninitialized near the start of a season
+            # (Jan/May/Sep). MetaculusClient.ACX_2025_TOURNAMENT = 32564 and
+            # MetaculusClient.AI_2027_TOURNAMENT_ID = "ai-2027" are also valid
+            # targets here.
+            template_bot.skip_previously_forecasted_questions = False
+            forecast_reports = asyncio.run(
+                template_bot.forecast_on_tournament(
+                    client.CURRENT_METACULUS_CUP_ID, return_exceptions=True
+                )
             )
-        )
-        forecast_reports = seasonal_tournament_reports + minibench_reports
-    elif run_mode == "metaculus_cup":
-        # The Metaculus Cup may be uninitialized near the start of a season
-        # (Jan/May/Sep). MetaculusClient.ACX_2025_TOURNAMENT = 32564 and
-        # MetaculusClient.AI_2027_TOURNAMENT_ID = "ai-2027" are also valid
-        # targets here.
-        template_bot.skip_previously_forecasted_questions = False
-        forecast_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                client.CURRENT_METACULUS_CUP_ID, return_exceptions=True
+        elif run_mode == "test_questions":
+            # The bot-testing-area tournament contains all question types and is
+            # the recommended target for smoke-testing your bot.
+            # https://www.metaculus.com/tournament/bot-testing-area/
+            template_bot.skip_previously_forecasted_questions = False
+            forecast_reports = asyncio.run(
+                template_bot.forecast_on_tournament(
+                    "bot-testing-area", return_exceptions=True
+                )
             )
-        )
-    elif run_mode == "test_questions":
-        # The bot-testing-area tournament contains all question types and is
-        # the recommended target for smoke-testing your bot.
-        # https://www.metaculus.com/tournament/bot-testing-area/
-        template_bot.skip_previously_forecasted_questions = False
-        forecast_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                "bot-testing-area", return_exceptions=True
-            )
-        )
+
+        spent = _current_cost(cost_manager)
+        if spent is not None:
+            logger.info(f"Run cost (MonetaryCostManager): ${spent:.4f} / cap ${max_cost_usd:.2f}")
 
     template_bot.log_report_summary(forecast_reports)
     print_run_summary_banner(
